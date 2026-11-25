@@ -326,15 +326,31 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-zinc-400 border-t border-zinc-800/80 pt-3.5">
-              <span>
-                共扫描内嵌图像：<strong className="font-mono text-zinc-200">{result.totalImages}</strong> 张
-              </span>
-              <span>
-                成功优化：<strong className="font-mono text-emerald-400">{result.optimizedImages}</strong> 张
-                <span className="text-zinc-600 mx-1.5">|</span>
-                保留原样：<strong className="font-mono text-zinc-300">{result.skippedImages}</strong> 张
-              </span>
+            <div className="space-y-2 border-t border-zinc-800/80 pt-3.5 text-xs text-zinc-400">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span>
+                  共扫描内嵌图像：<strong className="font-mono text-zinc-200">{result.totalImages}</strong> 张
+                  {result.totalImages > 0 && (
+                    <span className="text-zinc-500 ml-2">
+                      (图像流 {formatBytes(result.totalImageBytesBefore)} → {formatBytes(result.totalImageBytesAfter)})
+                    </span>
+                  )}
+                </span>
+                <span>
+                  成功优化：<strong className="font-mono text-emerald-400">{result.optimizedImages}</strong> 张
+                  <span className="text-zinc-600 mx-1.5">|</span>
+                  保留原样：<strong className="font-mono text-zinc-300">{result.skippedImages}</strong> 张
+                </span>
+              </div>
+
+              {Object.keys(result.skipReasons).length > 0 && (
+                <p className="text-zinc-500 leading-relaxed">
+                  保留原样原因：
+                  {Object.entries(result.skipReasons)
+                    .map(([reason, count]) => `${reason} (${count})`)
+                    .join('、')}
+                </p>
+              )}
             </div>
 
             <button
