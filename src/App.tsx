@@ -1,14 +1,24 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Download,
+  Eye,
   FileText,
   Loader2,
   SlidersHorizontal,
   Upload,
 } from 'lucide-react';
-import { compressPdfImages, type CompressionResult } from './services/pdfCompressor';
+import {
+  compressPdfImages,
+  inspectPdfImages,
+  renderPreviewForIndex,
+  type CompressionResult,
+  type PdfImageSession,
+  type PreviewRenderResult,
+} from './services/pdfCompressor';
 
 interface PresetOption {
   id: 'light' | 'balanced' | 'extreme';
@@ -20,23 +30,26 @@ interface PresetOption {
 const PRESETS: PresetOption[] = [
   {
     id: 'light',
-    label: '轻度压缩（画质优先，质量 0.85，最大边 2400px）',
+    label: '轻度压缩（画质优先，质量 0.85，最大边 2600px）',
     quality: 0.85,
-    maxDimension: 2400,
+    maxDimension: 2600,
   },
   {
     id: 'balanced',
-    label: '均衡压缩（推荐，质量 0.72，最大边 1800px）',
-    quality: 0.72,
-    maxDimension: 1800,
+    label: '均衡压缩（推荐，质量 0.75，最大边 2000px）',
+    quality: 0.75,
+    maxDimension: 2000,
   },
   {
     id: 'extreme',
-    label: '极限压缩（体积优先，质量 0.55，最大边 1200px）',
-    quality: 0.55,
-    maxDimension: 1200,
+    label: '极限压缩（体积优先，质量 0.58，最大边 1400px）',
+    quality: 0.58,
+    maxDimension: 1400,
   },
 ];
+
+type PreviewViewMode = 'split' | 'processed' | 'original';
+type PreviewZoomMode = 'fit' | '100' | '200';
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -50,26 +63,129 @@ export default function App() {
   const [isDragging, setIsDragging] = useState(false);
 
   const [presetId, setPresetId] = useState<PresetOption['id']>('balanced');
-  const [enableLowPassFilter, setEnableLowPassFilter] = useState(false);
+  const [smartFrequencyCompression, setSmartFrequencyCompression] = useState(true);
+  const [scanStrength, setScanStrength] = useState(0);
+  const [scanGrayscale, setScanGrayscale] = useState(false);
 
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState<{ current: number; total: number } | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [result, setResult] = useState<CompressionResult | null>(null);
 
+  // 预览状态
+  const sessionRef = useRef<PdfImageSession | null>(null);
+  const [sessionMeta, setSessionMeta] = useState<{
+    totalImages: number;
+    compressibleCount: number;
+  } | null>(null);
+  const [previewIndex, setPreviewIndex] = useState(0);
+  const [viewMode, setViewMode] = useState<PreviewViewMode>('split');
+  const [zoomMode, setZoomMode] = useState<PreviewZoomMode>('fit');
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewData, setPreviewData] = useState<PreviewRenderResult | null>(null);
+  const lastProcessedUrlRef = useRef<string | null>(null);
+
   const activePreset = PRESETS.find((p) => p.id === presetId) ?? PRESETS[1];
 
-  const handleFileSelect = (file: File | null | undefined) => {
+  useEffect(() => {
+    return () => {
+      sessionRef.current?.dispose();
+      sessionRef.current = null;
+      if (lastProcessedUrlRef.current) {
+        URL.revokeObjectURL(lastProcessedUrlRef.current);
+        lastProcessedUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleFileSelect = async (file: File | null | undefined) => {
     if (!file) return;
     if (file.type !== 'application/pdf' && !file.name.toLowerCase().endsWith('.pdf')) {
       setErrorMsg('请选择有效的 .pdf 文件。');
       return;
     }
+
     setSelectedFile(file);
     setResult(null);
     setErrorMsg(null);
     setProgress(null);
+    setPreviewError(null);
+    setPreviewData(null);
+    setPreviewIndex(0);
+
+    sessionRef.current?.dispose();
+    sessionRef.current = null;
+    setSessionMeta(null);
+
+    if (lastProcessedUrlRef.current) {
+      URL.revokeObjectURL(lastProcessedUrlRef.current);
+      lastProcessedUrlRef.current = null;
+    }
+
+    try {
+      const buffer = await file.arrayBuffer();
+      const session = await inspectPdfImages(buffer);
+      sessionRef.current = session;
+      setSessionMeta({
+        totalImages: session.totalImages,
+        compressibleCount: session.compressibleImages.length,
+      });
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : '解析 PDF 文件失败。');
+    }
   };
+
+  // 参数变化或切换预览索引时，防抖重算当前预览图
+  useEffect(() => {
+    const session = sessionRef.current;
+    if (!session || session.compressibleImages.length === 0) return;
+
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      setPreviewLoading(true);
+      setPreviewError(null);
+      try {
+        const res = await renderPreviewForIndex(session, previewIndex, {
+          quality: activePreset.quality,
+          maxDimension: activePreset.maxDimension,
+          smartFrequencyCompression,
+          scanStrength,
+          scanGrayscale,
+        });
+        if (cancelled) {
+          URL.revokeObjectURL(res.processedUrl);
+          return;
+        }
+        if (lastProcessedUrlRef.current) {
+          URL.revokeObjectURL(lastProcessedUrlRef.current);
+        }
+        lastProcessedUrlRef.current = res.processedUrl;
+        setPreviewData(res);
+      } catch (err) {
+        if (!cancelled) {
+          setPreviewError(err instanceof Error ? err.message : '预览生成失败。');
+        }
+      } finally {
+        if (!cancelled) {
+          setPreviewLoading(false);
+        }
+      }
+    }, 150);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    sessionMeta,
+    previewIndex,
+    activePreset.quality,
+    activePreset.maxDimension,
+    smartFrequencyCompression,
+    scanStrength,
+    scanGrayscale,
+  ]);
 
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -92,7 +208,9 @@ export default function App() {
         {
           quality: activePreset.quality,
           maxDimension: activePreset.maxDimension,
-          enableLowPassFilter,
+          smartFrequencyCompression,
+          scanStrength,
+          scanGrayscale,
         },
         (current, total) => setProgress({ current, total })
       );
@@ -123,9 +241,35 @@ export default function App() {
   const progressPercent =
     progress && progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
 
+  const previewDeltaPercent =
+    previewData && previewData.originalBytes > 0
+      ? ((previewData.processedBytes - previewData.originalBytes) / previewData.originalBytes) * 100
+      : 0;
+
+  const renderPreviewImage = (src: string, alt: string, widthPx: number) => {
+    if (zoomMode === 'fit') {
+      return (
+        <img
+          src={src}
+          alt={alt}
+          className="max-w-full max-h-80 object-contain mx-auto block"
+        />
+      );
+    }
+    const scale = zoomMode === '200' ? 2 : 1;
+    return (
+      <img
+        src={src}
+        alt={alt}
+        style={{ width: `${widthPx * scale}px`, maxWidth: 'none' }}
+        className="block"
+      />
+    );
+  };
+
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col items-center px-4 py-10 sm:py-14">
-      <div className="w-full max-w-2xl space-y-6">
+    <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col items-center px-4 py-10 sm:py-12">
+      <div className="w-full max-w-4xl space-y-6">
         {/* Header */}
         <header className="space-y-2 border-b border-zinc-800 pb-5">
           <div className="flex items-center justify-between gap-3">
@@ -137,12 +281,12 @@ export default function App() {
             </span>
           </div>
           <p className="text-sm text-zinc-400 leading-relaxed">
-            直接解析 PDF 底层对象树并重压缩内嵌位图（Image Stream），保留原始矢量文本、公式、书签与超链接结构不变；仅在压缩后体积更小时替换原图流。
+            直接解析 PDF 底层对象树并压缩内嵌图像，保留矢量文本、公式与书签；支持频率感知自适应降噪、文档扫描漂白增强与实时对比预览。
           </p>
         </header>
 
         {/* File Upload */}
-        <section className="space-y-3">
+        <section>
           <input
             ref={fileInputRef}
             type="file"
@@ -166,7 +310,7 @@ export default function App() {
             }}
             onDragLeave={() => setIsDragging(false)}
             onDrop={handleDrop}
-            className={`rounded-lg border border-dashed p-6 transition-colors cursor-pointer flex items-center justify-between gap-4 ${
+            className={`rounded-lg border border-dashed p-5 transition-colors cursor-pointer flex items-center justify-between gap-4 ${
               isDragging
                 ? 'border-slate-400 bg-slate-900/60'
                 : 'border-zinc-800 bg-zinc-900/40 hover:border-zinc-700 hover:bg-zinc-900/70'
@@ -184,6 +328,11 @@ export default function App() {
                     </p>
                     <p className="text-xs font-mono text-zinc-400 mt-0.5">
                       原始大小：{formatBytes(selectedFile.size)}
+                      {sessionMeta && (
+                        <span className="text-zinc-500 ml-2">
+                          · 共 {sessionMeta.totalImages} 张内嵌图（{sessionMeta.compressibleCount} 张可预览/处理）
+                        </span>
+                      )}
                     </p>
                   </>
                 ) : (
@@ -192,7 +341,7 @@ export default function App() {
                       点击或拖拽 PDF 文件到此处
                     </p>
                     <p className="text-xs text-zinc-500 mt-0.5">
-                      所有处理均在浏览器内存中完成，文件不会上传至服务器
+                      所有解析与图像编码均在浏览器内存中完成，文件不会上传至服务器
                     </p>
                   </>
                 )}
@@ -208,7 +357,7 @@ export default function App() {
         <section className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-5 space-y-4">
           <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wider text-zinc-400">
             <SlidersHorizontal className="w-3.5 h-3.5" />
-            <span>压缩参数</span>
+            <span>压缩与扫描参数</span>
           </div>
 
           <div className="space-y-1.5">
@@ -233,17 +382,60 @@ export default function App() {
           <label className="flex items-start gap-2.5 cursor-pointer select-none pt-1">
             <input
               type="checkbox"
-              checked={enableLowPassFilter}
+              checked={smartFrequencyCompression}
               disabled={isProcessing}
-              onChange={(e) => setEnableLowPassFilter(e.target.checked)}
+              onChange={(e) => setSmartFrequencyCompression(e.target.checked)}
               className="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-950 accent-slate-500"
             />
             <span className="text-sm text-zinc-300">
-              开启轻度低通滤波（去除扫描件噪点，进一步减小体积）
+              智能频率感知压缩（8×8 平坦背景区自动降噪省体积，高频文字笔迹保持锐利）
             </span>
           </label>
 
-          <div className="pt-2">
+          {/* Document Scan Slider */}
+          <div className="rounded-md border border-zinc-800/80 bg-zinc-950/50 p-3.5 space-y-2.5">
+            <div className="flex items-center justify-between gap-2">
+              <label htmlFor="scan-slider" className="text-sm text-zinc-200">
+                文档扫描增强（白底黑字 / 去除底纹与阴影）
+              </label>
+              <span className="text-xs font-mono px-2 py-0.5 rounded bg-zinc-900 border border-zinc-800 text-zinc-300">
+                {scanStrength === 0 ? '关闭' : `${scanStrength}%`}
+              </span>
+            </div>
+            <input
+              id="scan-slider"
+              type="range"
+              min={0}
+              max={100}
+              step={5}
+              value={scanStrength}
+              disabled={isProcessing}
+              onChange={(e) => setScanStrength(Number(e.target.value))}
+              className="w-full accent-slate-300 cursor-pointer"
+            />
+            <div className="flex items-center justify-between text-[11px] text-zinc-500">
+              <span>0%（保留原片色调）</span>
+              <span>50%（适度漂白提亮）</span>
+              <span>100%（强力白底黑字）</span>
+            </div>
+
+            {scanStrength > 0 && (
+              <label className="flex items-center gap-2 cursor-pointer select-none pt-1 border-t border-zinc-800/70">
+                <input
+                  type="checkbox"
+                  checked={scanGrayscale}
+                  disabled={isProcessing}
+                  onChange={(e) => setScanGrayscale(e.target.checked)}
+                  className="h-3.5 w-3.5 rounded border-zinc-700 bg-zinc-950 accent-slate-500"
+                />
+                <span className="text-xs text-zinc-400">
+                  纯黑白灰度输出（去除彩色笔迹，进一步减小体积）
+                </span>
+              </label>
+            )}
+          </div>
+
+          <div className="pt-1">
             <button
               type="button"
               disabled={!selectedFile || isProcessing}
@@ -254,14 +446,14 @@ export default function App() {
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
                   <span>
-                    正在处理
+                    正在处理全文档
                     {progress && progress.total > 0
                       ? ` (${progress.current}/${progress.total} 张图像)`
                       : '...'}
                   </span>
                 </>
               ) : (
-                <span>开始压缩</span>
+                <span>开始压缩并导出</span>
               )}
             </button>
           </div>
@@ -278,6 +470,167 @@ export default function App() {
             </div>
           )}
         </section>
+
+        {/* Live Preview Panel */}
+        {sessionMeta && sessionMeta.compressibleCount > 0 && (
+          <section className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-5 space-y-4">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wider text-zinc-400">
+                <Eye className="w-3.5 h-3.5" />
+                <span>实时效果预览</span>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                {/* Image Pagination */}
+                <div className="flex items-center rounded-md border border-zinc-800 bg-zinc-950">
+                  <button
+                    type="button"
+                    disabled={previewIndex <= 0}
+                    onClick={() => setPreviewIndex((i) => Math.max(0, i - 1))}
+                    className="p-1.5 text-zinc-400 hover:text-zinc-100 disabled:opacity-30 cursor-pointer"
+                    title="上一张"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                  </button>
+                  <span className="px-2 font-mono text-zinc-300">
+                    第 {previewIndex + 1} / {sessionMeta.compressibleCount} 张
+                  </span>
+                  <button
+                    type="button"
+                    disabled={previewIndex >= sessionMeta.compressibleCount - 1}
+                    onClick={() =>
+                      setPreviewIndex((i) =>
+                        Math.min(sessionMeta.compressibleCount - 1, i + 1)
+                      )
+                    }
+                    className="p-1.5 text-zinc-400 hover:text-zinc-100 disabled:opacity-30 cursor-pointer"
+                    title="下一张"
+                  >
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+
+                {/* View Mode */}
+                <div className="flex items-center rounded-md border border-zinc-800 bg-zinc-950 p-0.5">
+                  {(
+                    [
+                      ['split', '并排对比'],
+                      ['processed', '仅看效果'],
+                      ['original', '仅看原图'],
+                    ] as const
+                  ).map(([mode, label]) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      onClick={() => setViewMode(mode)}
+                      className={`px-2 py-1 rounded text-xs cursor-pointer transition-colors ${
+                        viewMode === mode
+                          ? 'bg-zinc-800 text-zinc-100'
+                          : 'text-zinc-400 hover:text-zinc-200'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Zoom Mode */}
+                <div className="flex items-center rounded-md border border-zinc-800 bg-zinc-950 p-0.5">
+                  {(
+                    [
+                      ['fit', '适应'],
+                      ['100', '100%'],
+                      ['200', '200%'],
+                    ] as const
+                  ).map(([z, label]) => (
+                    <button
+                      key={z}
+                      type="button"
+                      onClick={() => setZoomMode(z)}
+                      className={`px-2 py-1 rounded font-mono text-xs cursor-pointer transition-colors ${
+                        zoomMode === z
+                          ? 'bg-zinc-800 text-zinc-100'
+                          : 'text-zinc-400 hover:text-zinc-200'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {previewError && (
+              <p className="text-xs text-red-400">{previewError}</p>
+            )}
+
+            {previewData && (
+              <>
+                <div
+                  className={`grid gap-3 ${
+                    viewMode === 'split' ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-1'
+                  }`}
+                >
+                  {(viewMode === 'split' || viewMode === 'original') && (
+                    <div className="rounded-md border border-zinc-800 bg-zinc-950/70 p-2.5 space-y-2">
+                      <div className="flex items-center justify-between text-[11px] font-mono text-zinc-400">
+                        <span>原图 ({previewData.srcWidth}×{previewData.srcHeight})</span>
+                        <span>{formatBytes(previewData.originalBytes)}</span>
+                      </div>
+                      <div className="max-h-80 overflow-auto rounded bg-zinc-900/60 p-1">
+                        {renderPreviewImage(
+                          previewData.originalUrl,
+                          '原图预览',
+                          previewData.srcWidth
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {(viewMode === 'split' || viewMode === 'processed') && (
+                    <div className="rounded-md border border-zinc-800 bg-zinc-950/70 p-2.5 space-y-2">
+                      <div className="flex items-center justify-between text-[11px] font-mono text-zinc-400">
+                        <span>
+                          处理后 ({previewData.targetWidth}×{previewData.targetHeight})
+                          {previewLoading && ' · 更新中...'}
+                        </span>
+                        <span
+                          className={
+                            previewDeltaPercent < 0 ? 'text-emerald-400' : 'text-amber-400'
+                          }
+                        >
+                          {formatBytes(previewData.processedBytes)} (
+                          {previewDeltaPercent > 0 ? '+' : ''}
+                          {previewDeltaPercent.toFixed(1)}%)
+                        </span>
+                      </div>
+                      <div className="max-h-80 overflow-auto rounded bg-zinc-900/60 p-1">
+                        {renderPreviewImage(
+                          previewData.processedUrl,
+                          '处理后预览',
+                          previewData.targetWidth
+                        )}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {previewDeltaPercent >= 0 && (
+                  <p className="text-[11px] text-zinc-500">
+                    提示：当前预览图处理后体积未低于原图，正式导出时将按安全策略自动保留原图像流（若需应用扫描增强效果，可适当降低压缩质量或开启灰度输出）。
+                  </p>
+                )}
+              </>
+            )}
+
+            {!previewData && previewLoading && (
+              <div className="flex items-center justify-center py-10 text-xs text-zinc-400 gap-2">
+                <Loader2 className="w-4 h-4 animate-spin" />
+                <span>正在解码预览图像...</span>
+              </div>
+            )}
+          </section>
+        )}
 
         {/* Error Message */}
         {errorMsg && (

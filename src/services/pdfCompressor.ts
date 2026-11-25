@@ -11,12 +11,13 @@ import {
   PDFString,
 } from 'pdf-lib';
 import pako from 'pako';
+import {
+  canvasToBlobBytes,
+  processImageSource,
+  type ImageProcessOptions,
+} from './imageProcessor';
 
-export interface CompressionOptions {
-  quality: number;
-  maxDimension: number;
-  enableLowPassFilter: boolean;
-}
+export type CompressionOptions = ImageProcessOptions;
 
 export interface CompressionResult {
   compressedBytes: Uint8Array;
@@ -29,6 +30,36 @@ export interface CompressionResult {
   totalImageBytesBefore: number;
   totalImageBytesAfter: number;
   skipReasons: Record<string, number>;
+}
+
+export interface PreviewImageEntry {
+  index: number;
+  refKey: string;
+  width: number;
+  height: number;
+  originalBytes: number;
+  ref: PDFRef;
+  stream: PDFRawStream;
+  cachedCanvas?: HTMLCanvasElement;
+  cachedOriginalUrl?: string;
+}
+
+export interface PdfImageSession {
+  totalImages: number;
+  compressibleImages: PreviewImageEntry[];
+  skipReasons: Record<string, number>;
+  dispose: () => void;
+}
+
+export interface PreviewRenderResult {
+  originalUrl: string;
+  processedUrl: string;
+  originalBytes: number;
+  processedBytes: number;
+  srcWidth: number;
+  srcHeight: number;
+  targetWidth: number;
+  targetHeight: number;
 }
 
 type ResolvedColorSpace =
@@ -128,7 +159,11 @@ function resolveColorSpace(
         palette = lookupObj.asBytes();
       } else if (lookupObj instanceof PDFRawStream) {
         const filters = resolveFilters(lookupObj.dict);
-        if (filters !== 'UNSUPPORTED' && filters.length === 1 && filters[0] === PDFName.of('FlateDecode')) {
+        if (
+          filters !== 'UNSUPPORTED' &&
+          filters.length === 1 &&
+          filters[0] === PDFName.of('FlateDecode')
+        ) {
           palette = pako.inflate(lookupObj.contents);
         } else if (filters !== 'UNSUPPORTED' && filters.length === 0) {
           palette = lookupObj.contents;
@@ -169,7 +204,6 @@ function unpredictData(
 ): Uint8Array | null {
   if (predictor <= 1) return data;
 
-  // TIFF Predictor 2 (Horizontal differencing, 8-bit)
   if (predictor === 2) {
     if (bpc !== 8) return null;
     const rowBytes = columns * colors;
@@ -186,7 +220,6 @@ function unpredictData(
     return out;
   }
 
-  // PNG Predictors (10-15)
   if (predictor >= 10 && predictor <= 15) {
     const rowBytes = Math.ceil((columns * colors * bpc) / 8);
     const stride = rowBytes + 1;
@@ -233,27 +266,6 @@ function unpredictData(
   }
 
   return null;
-}
-
-function canvasToJpegBytes(canvas: HTMLCanvasElement, quality: number): Promise<Uint8Array> {
-  return new Promise((resolve, reject) => {
-    canvas.toBlob(
-      async (blob) => {
-        if (!blob) {
-          reject(new Error('Canvas JPEG 编码失败'));
-          return;
-        }
-        try {
-          const buf = await blob.arrayBuffer();
-          resolve(new Uint8Array(buf));
-        } catch (err) {
-          reject(err);
-        }
-      },
-      'image/jpeg',
-      quality
-    );
-  });
 }
 
 function pixelsToCanvas(
@@ -315,19 +327,266 @@ function pixelsToCanvas(
   return canvas;
 }
 
-function computeTargetDimensions(
-  width: number,
-  height: number,
-  maxDimension: number
-): { targetWidth: number; targetHeight: number } {
-  const maxSide = Math.max(width, height);
-  if (maxSide <= maxDimension) {
-    return { targetWidth: width, targetHeight: height };
+type DecodedPdfImageResult =
+  | { canvas: HTMLCanvasElement; width: number; height: number }
+  | { skipReason: string };
+
+function validateImageEntry(
+  ref: PDFRef,
+  obj: PDFRawStream,
+  maskRefKeys: Set<string>,
+  context: PDFDocument['context']
+):
+  | {
+      ok: true;
+      width: number;
+      height: number;
+      cs: Extract<ResolvedColorSpace, { kind: 'rgb' | 'gray' | 'indexed' }>;
+      isDct: boolean;
+      isFlateDct: boolean;
+      isFlate: boolean;
+    }
+  | { ok: false; skipReason: string } {
+  const dict = obj.dict;
+
+  if (maskRefKeys.has(ref.toString())) {
+    return { ok: false, skipReason: '透明遮罩流（保持原样）' };
   }
-  const scale = maxDimension / maxSide;
+  const imageMask = dict.lookup(PDFName.of('ImageMask'));
+  if (imageMask instanceof PDFBool && imageMask.asBoolean()) {
+    return { ok: false, skipReason: '单色遮罩（保持原样）' };
+  }
+  if (dict.has(PDFName.of('Mask'))) {
+    return { ok: false, skipReason: '颜色键遮罩（保持原样）' };
+  }
+
+  const bpc = resolveNumber(dict, 'BitsPerComponent');
+  if (bpc !== null && bpc !== 8) {
+    return { ok: false, skipReason: `非 8-bit 通道 (${bpc}bit)` };
+  }
+
+  const width = resolveNumber(dict, 'Width');
+  const height = resolveNumber(dict, 'Height');
+  if (width === null || height === null || width <= 0 || height <= 0) {
+    return { ok: false, skipReason: '缺失宽高信息' };
+  }
+
+  const cs = resolveColorSpace(dict.lookup(PDFName.of('ColorSpace')), context);
+  if (cs.kind === 'unsupported') {
+    return { ok: false, skipReason: `色彩空间不支持 (${cs.label})` };
+  }
+
+  const filters = resolveFilters(dict);
+  if (filters === 'UNSUPPORTED') {
+    return { ok: false, skipReason: '滤镜链不支持' };
+  }
+
+  const isDct = filters.length === 1 && filters[0] === PDFName.of('DCTDecode');
+  const isFlateDct =
+    filters.length === 2 &&
+    filters[0] === PDFName.of('FlateDecode') &&
+    filters[1] === PDFName.of('DCTDecode');
+  const isFlate =
+    filters.length === 1 && filters[0] === PDFName.of('FlateDecode');
+  const isUncompressed = filters.length === 0;
+
+  if (!isDct && !isFlateDct && !isFlate && !isUncompressed) {
+    const fLabel = filters.map((f) => f.asString()).join('+');
+    return { ok: false, skipReason: `编码滤镜不支持 (${fLabel})` };
+  }
+
+  return { ok: true, width, height, cs, isDct, isFlateDct, isFlate };
+}
+
+async function decodePdfImageEntry(
+  ref: PDFRef,
+  obj: PDFRawStream,
+  maskRefKeys: Set<string>,
+  context: PDFDocument['context']
+): Promise<DecodedPdfImageResult> {
+  const check = validateImageEntry(ref, obj, maskRefKeys, context);
+  if (!check.ok) {
+    return { skipReason: check.skipReason };
+  }
+
+  const { width, height, cs, isDct, isFlateDct, isFlate } = check;
+  const dict = obj.dict;
+
+  if (isDct || isFlateDct) {
+    const jpegBytes = isFlateDct ? pako.inflate(obj.contents) : obj.contents;
+    const jpegBlob = new Blob([new Uint8Array(jpegBytes)], { type: 'image/jpeg' });
+    const bitmap = await createImageBitmap(jpegBlob);
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        canvas.width = 0;
+        canvas.height = 0;
+        return { skipReason: 'Canvas 上下文创建失败' };
+      }
+      ctx.drawImage(bitmap, 0, 0);
+      return { canvas, width: bitmap.width, height: bitmap.height };
+    } finally {
+      bitmap.close();
+    }
+  }
+
+  let rawPixels: Uint8Array | null = isFlate
+    ? pako.inflate(obj.contents)
+    : obj.contents;
+
+  const decodeParms = resolveDecodeParms(dict);
+  if (decodeParms) {
+    const predictor = resolveNumber(decodeParms, 'Predictor') ?? 1;
+    if (predictor > 1) {
+      const columns = resolveNumber(decodeParms, 'Columns') ?? width;
+      const colors =
+        resolveNumber(decodeParms, 'Colors') ?? (cs.kind === 'rgb' ? 3 : 1);
+      const parmBpc = resolveNumber(decodeParms, 'BitsPerComponent') ?? 8;
+      rawPixels = unpredictData(rawPixels, predictor, columns, colors, parmBpc);
+      if (!rawPixels) {
+        return { skipReason: `Predictor(${predictor}) 不支持` };
+      }
+    }
+  }
+
+  const canvas = pixelsToCanvas(rawPixels, width, height, cs);
+  if (!canvas) {
+    return { skipReason: '像素数据长度不匹配' };
+  }
+  return { canvas, width, height };
+}
+
+function collectMaskRefKeys(imageEntries: [PDFRef, PDFRawStream][]): Set<string> {
+  const maskRefKeys = new Set<string>();
+  for (const [, obj] of imageEntries) {
+    const sMask = obj.dict.get(PDFName.of('SMask'));
+    if (sMask instanceof PDFRef) maskRefKeys.add(sMask.toString());
+    const mask = obj.dict.get(PDFName.of('Mask'));
+    if (mask instanceof PDFRef) maskRefKeys.add(mask.toString());
+  }
+  return maskRefKeys;
+}
+
+async function loadPdfSafe(fileBuffer: ArrayBuffer): Promise<PDFDocument> {
+  try {
+    return await PDFDocument.load(fileBuffer.slice(0), { ignoreEncryption: false });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.toLowerCase().includes('encrypt')) {
+      throw new Error('该 PDF 文档受密码或加密保护，请先移除加密后再处理。');
+    }
+    throw new Error(`无法解析 PDF 文件：${msg}`);
+  }
+}
+
+export async function inspectPdfImages(
+  fileBuffer: ArrayBuffer
+): Promise<PdfImageSession> {
+  const pdfDoc = await loadPdfSafe(fileBuffer);
+  const imageEntries = pdfDoc.context
+    .enumerateIndirectObjects()
+    .filter((entry): entry is [PDFRef, PDFRawStream] => {
+      const [, obj] = entry;
+      if (!(obj instanceof PDFRawStream)) return false;
+      return obj.dict.lookup(PDFName.of('Subtype')) === PDFName.of('Image');
+    });
+
+  const maskRefKeys = collectMaskRefKeys(imageEntries);
+  const skipReasons: Record<string, number> = {};
+  const compressibleImages: PreviewImageEntry[] = [];
+
+  for (const [ref, stream] of imageEntries) {
+    const check = validateImageEntry(ref, stream, maskRefKeys, pdfDoc.context);
+    if (!check.ok) {
+      addSkipReason(skipReasons, check.skipReason);
+      continue;
+    }
+    compressibleImages.push({
+      index: compressibleImages.length,
+      refKey: ref.toString(),
+      width: check.width,
+      height: check.height,
+      originalBytes: stream.contents.length,
+      ref,
+      stream,
+    });
+  }
+
   return {
-    targetWidth: Math.max(1, Math.round(width * scale)),
-    targetHeight: Math.max(1, Math.round(height * scale)),
+    totalImages: imageEntries.length,
+    compressibleImages,
+    skipReasons,
+    dispose: () => {
+      for (const item of compressibleImages) {
+        if (item.cachedCanvas) {
+          item.cachedCanvas.width = 0;
+          item.cachedCanvas.height = 0;
+          item.cachedCanvas = undefined;
+        }
+        if (item.cachedOriginalUrl) {
+          URL.revokeObjectURL(item.cachedOriginalUrl);
+          item.cachedOriginalUrl = undefined;
+        }
+      }
+    },
+  };
+}
+
+export async function renderPreviewForIndex(
+  session: PdfImageSession,
+  idx: number,
+  options: ImageProcessOptions
+): Promise<PreviewRenderResult> {
+  const entry = session.compressibleImages[idx];
+  if (!entry) {
+    throw new Error('预览图像索引无效');
+  }
+
+  // 解码并缓存原图 Canvas 与原图 Blob URL，滑块调整时无需重新解压 PDF 流
+  if (!entry.cachedCanvas) {
+    const decoded = await decodePdfImageEntry(
+      entry.ref,
+      entry.stream,
+      new Set<string>(),
+      entry.stream.dict.context
+    );
+    if ('skipReason' in decoded) {
+      throw new Error(`图像解码失败：${decoded.skipReason}`);
+    }
+    entry.cachedCanvas = decoded.canvas;
+    entry.width = decoded.width;
+    entry.height = decoded.height;
+  }
+
+  if (!entry.cachedOriginalUrl) {
+    const origPngBytes = await canvasToBlobBytes(entry.cachedCanvas, 'image/png');
+    const origBlob = new Blob([new Uint8Array(origPngBytes)], { type: 'image/png' });
+    entry.cachedOriginalUrl = URL.createObjectURL(origBlob);
+  }
+
+  const processed = await processImageSource(
+    entry.cachedCanvas,
+    entry.width,
+    entry.height,
+    options
+  );
+  const procBlob = new Blob([new Uint8Array(processed.jpegBytes)], {
+    type: 'image/jpeg',
+  });
+  const processedUrl = URL.createObjectURL(procBlob);
+
+  return {
+    originalUrl: entry.cachedOriginalUrl,
+    processedUrl,
+    originalBytes: entry.originalBytes,
+    processedBytes: processed.jpegBytes.length,
+    srcWidth: entry.width,
+    srcHeight: entry.height,
+    targetWidth: processed.targetWidth,
+    targetHeight: processed.targetHeight,
   };
 }
 
@@ -337,35 +596,17 @@ export async function compressPdfImages(
   onProgress?: (current: number, total: number) => void
 ): Promise<CompressionResult> {
   const originalSize = fileBuffer.byteLength;
-
-  let pdfDoc: PDFDocument;
-  try {
-    pdfDoc = await PDFDocument.load(fileBuffer.slice(0), { ignoreEncryption: false });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.toLowerCase().includes('encrypt')) {
-      throw new Error('该 PDF 文档受密码或加密保护，请先移除加密后再处理。');
-    }
-    throw new Error(`无法解析 PDF 文件：${msg}`);
-  }
+  const pdfDoc = await loadPdfSafe(fileBuffer);
 
   const imageEntries = pdfDoc.context
     .enumerateIndirectObjects()
-    .filter(([, obj]) => {
+    .filter((entry): entry is [PDFRef, PDFRawStream] => {
+      const [, obj] = entry;
       if (!(obj instanceof PDFRawStream)) return false;
       return obj.dict.lookup(PDFName.of('Subtype')) === PDFName.of('Image');
     });
 
-  // 预先收集所有被 /SMask 或 /Mask 引用的遮罩对象，避免将 Alpha 通道误转为彩色 JPEG
-  const maskRefKeys = new Set<string>();
-  for (const [, obj] of imageEntries) {
-    if (!(obj instanceof PDFRawStream)) continue;
-    const sMask = obj.dict.get(PDFName.of('SMask'));
-    if (sMask instanceof PDFRef) maskRefKeys.add(sMask.toString());
-    const mask = obj.dict.get(PDFName.of('Mask'));
-    if (mask instanceof PDFRef) maskRefKeys.add(mask.toString());
-  }
-
+  const maskRefKeys = collectMaskRefKeys(imageEntries);
   const totalImages = imageEntries.length;
   let optimizedImages = 0;
   let skippedImages = 0;
@@ -377,181 +618,55 @@ export async function compressPdfImages(
     const [ref, obj] = imageEntries[idx];
     onProgress?.(idx + 1, totalImages);
 
-    if (!(obj instanceof PDFRawStream)) {
-      skippedImages++;
-      addSkipReason(skipReasons, '非流对象');
-      continue;
-    }
-
     const origBytesLen = obj.contents.length;
     totalImageBytesBefore += origBytesLen;
-
-    const dict = obj.dict;
     let replaced = false;
 
     try {
-      // 跳过本身作为透明遮罩（SMask/Mask）或单色图像遮罩（ImageMask）的流
-      if (maskRefKeys.has(ref.toString())) {
-        skippedImages++;
-        addSkipReason(skipReasons, '透明遮罩流（保持原样）');
-        continue;
-      }
-      const imageMask = dict.lookup(PDFName.of('ImageMask'));
-      if (imageMask instanceof PDFBool && imageMask.asBoolean()) {
-        skippedImages++;
-        addSkipReason(skipReasons, '单色遮罩（保持原样）');
-        continue;
-      }
-      if (dict.has(PDFName.of('Mask'))) {
-        skippedImages++;
-        addSkipReason(skipReasons, '颜色键遮罩（保持原样）');
-        continue;
-      }
+      const decoded = await decodePdfImageEntry(
+        ref,
+        obj,
+        maskRefKeys,
+        pdfDoc.context
+      );
 
-      const bpc = resolveNumber(dict, 'BitsPerComponent');
-      if (bpc !== null && bpc !== 8) {
+      if ('skipReason' in decoded) {
         skippedImages++;
-        addSkipReason(skipReasons, `非 8-bit 通道 (${bpc}bit)`);
+        addSkipReason(skipReasons, decoded.skipReason);
         continue;
       }
-
-      const width = resolveNumber(dict, 'Width');
-      const height = resolveNumber(dict, 'Height');
-      if (width === null || height === null || width <= 0 || height <= 0) {
-        skippedImages++;
-        addSkipReason(skipReasons, '缺失宽高信息');
-        continue;
-      }
-
-      const cs = resolveColorSpace(dict.lookup(PDFName.of('ColorSpace')), pdfDoc.context);
-      if (cs.kind === 'unsupported') {
-        skippedImages++;
-        addSkipReason(skipReasons, `色彩空间不支持 (${cs.label})`);
-        continue;
-      }
-
-      const filters = resolveFilters(dict);
-      if (filters === 'UNSUPPORTED') {
-        skippedImages++;
-        addSkipReason(skipReasons, '滤镜链不支持');
-        continue;
-      }
-
-      const isDct =
-        filters.length === 1 && filters[0] === PDFName.of('DCTDecode');
-      const isFlateDct =
-        filters.length === 2 &&
-        filters[0] === PDFName.of('FlateDecode') &&
-        filters[1] === PDFName.of('DCTDecode');
-      const isFlate =
-        filters.length === 1 && filters[0] === PDFName.of('FlateDecode');
-      const isUncompressed = filters.length === 0;
-
-      if (!isDct && !isFlateDct && !isFlate && !isUncompressed) {
-        skippedImages++;
-        const fLabel = filters.map((f) => f.asString()).join('+');
-        addSkipReason(skipReasons, `编码滤镜不支持 (${fLabel})`);
-        continue;
-      }
-
-      let sourceCanvas: HTMLCanvasElement | null = null;
-      let bitmap: ImageBitmap | null = null;
 
       try {
-        if (isDct || isFlateDct) {
-          const jpegBytes = isFlateDct ? pako.inflate(obj.contents) : obj.contents;
-          const jpegBlob = new Blob([new Uint8Array(jpegBytes)], { type: 'image/jpeg' });
-          bitmap = await createImageBitmap(jpegBlob);
-        } else {
-          let rawPixels: Uint8Array | null = isFlate
-            ? pako.inflate(obj.contents)
-            : obj.contents;
-
-          const decodeParms = resolveDecodeParms(dict);
-          if (decodeParms) {
-            const predictor = resolveNumber(decodeParms, 'Predictor') ?? 1;
-            if (predictor > 1) {
-              const columns = resolveNumber(decodeParms, 'Columns') ?? width;
-              const colors =
-                resolveNumber(decodeParms, 'Colors') ?? (cs.kind === 'rgb' ? 3 : 1);
-              const parmBpc = resolveNumber(decodeParms, 'BitsPerComponent') ?? 8;
-              rawPixels = unpredictData(rawPixels, predictor, columns, colors, parmBpc);
-              if (!rawPixels) {
-                skippedImages++;
-                addSkipReason(skipReasons, `Predictor(${predictor}) 不支持`);
-                continue;
-              }
-            }
-          }
-
-          sourceCanvas = pixelsToCanvas(rawPixels, width, height, cs);
-          if (!sourceCanvas) {
-            skippedImages++;
-            addSkipReason(skipReasons, '像素数据长度不匹配');
-            continue;
-          }
-        }
-
-        const srcW = bitmap ? bitmap.width : width;
-        const srcH = bitmap ? bitmap.height : height;
-        const { targetWidth, targetHeight } = computeTargetDimensions(
-          srcW,
-          srcH,
-          options.maxDimension
+        const { jpegBytes, targetWidth, targetHeight } = await processImageSource(
+          decoded.canvas,
+          decoded.width,
+          decoded.height,
+          options
         );
 
-        const outCanvas = document.createElement('canvas');
-        outCanvas.width = targetWidth;
-        outCanvas.height = targetHeight;
-        const outCtx = outCanvas.getContext('2d');
-        if (!outCtx) {
-          skippedImages++;
-          addSkipReason(skipReasons, 'Canvas 上下文创建失败');
-          continue;
-        }
-
-        outCtx.imageSmoothingEnabled = true;
-        outCtx.imageSmoothingQuality = 'high';
-        if (options.enableLowPassFilter) {
-          outCtx.filter = 'blur(0.4px)';
-        }
-
-        outCtx.fillStyle = '#ffffff';
-        outCtx.fillRect(0, 0, targetWidth, targetHeight);
-
-        if (bitmap) {
-          outCtx.drawImage(bitmap, 0, 0, targetWidth, targetHeight);
-        } else if (sourceCanvas) {
-          outCtx.drawImage(sourceCanvas, 0, 0, targetWidth, targetHeight);
-        }
-
-        const newBytes = await canvasToJpegBytes(outCanvas, options.quality);
-
-        // 安全替换策略：仅当新生成的 JPEG 字节长度严格小于原流字节长度时替换
-        if (newBytes.length < origBytesLen) {
+        // 仅当新流字节严格小于原流字节时替换
+        if (jpegBytes.length < origBytesLen) {
+          const dict = obj.dict;
           dict.set(PDFName.of('Filter'), PDFName.of('DCTDecode'));
           dict.set(PDFName.of('ColorSpace'), PDFName.of('DeviceRGB'));
           dict.set(PDFName.of('BitsPerComponent'), PDFNumber.of(8));
           dict.set(PDFName.of('Width'), PDFNumber.of(targetWidth));
           dict.set(PDFName.of('Height'), PDFNumber.of(targetHeight));
-          dict.set(PDFName.of('Length'), PDFNumber.of(newBytes.length));
+          dict.set(PDFName.of('Length'), PDFNumber.of(jpegBytes.length));
           dict.delete(PDFName.of('DecodeParms'));
           dict.delete(PDFName.of('Decode'));
 
-          pdfDoc.context.assign(ref, PDFRawStream.of(dict, newBytes));
+          pdfDoc.context.assign(ref, PDFRawStream.of(dict, jpegBytes));
           optimizedImages++;
-          totalImageBytesAfter += newBytes.length;
+          totalImageBytesAfter += jpegBytes.length;
           replaced = true;
         } else {
           skippedImages++;
           addSkipReason(skipReasons, '压缩后体积未变小');
         }
       } finally {
-        bitmap?.close();
-        if (sourceCanvas) {
-          sourceCanvas.width = 0;
-          sourceCanvas.height = 0;
-        }
+        decoded.canvas.width = 0;
+        decoded.canvas.height = 0;
       }
     } catch {
       skippedImages++;
